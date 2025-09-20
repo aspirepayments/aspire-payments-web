@@ -1,0 +1,83 @@
+openapi: 3.1.0
+info:
+  title: Aspire Unified Payments API
+  version: 0.1.0
+servers:
+  - url: http://localhost:3000/v1
+paths:
+  /oauth/token:
+    post:
+      operationId: getToken
+      summary: Client credentials token (stub)
+      responses:
+        '200':
+          description: OK
+  /bank-accounts/link-token:
+    post:
+      operationId: createLinkToken
+      summary: Create Plaid Link token
+      responses:
+        '200': { description: OK }
+  /payments:
+    post:
+      operationId: createPayment
+      summary: Create a payment (card or bank)
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer }
+                currency: { type: string }
+                method: { type: string, enum: [card, bank] }
+                rail: { type: string, enum: [ach, rtp_rfp, fednow] }
+                provider_pref: { type: string, enum: [nmi, authorize_net, plaid] }
+                token: { type: string }
+                plaid_account_id: { type: string }
+                capture: { type: boolean }
+      responses:
+        '201':
+          description: Created
+  /payments/{id}:
+    get:
+      operationId: getPayment
+      summary: Get a payment
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: OK }
+        '404': { description: Not Found }
+  /payments/{id}/refunds:
+    post:
+      operationId: createRefund
+      summary: Create a refund for a payment
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: { type: integer, description: Cents; default: full amount }
+      responses:
+        '202': { description: Accepted }
+  /webhooks/plaid:
+    post: { summary: Plaid webhook, responses: { '202': { description: Accepted } } }
+  /webhooks/nmi:
+    post: { summary: NMI webhook, responses: { '202': { description: Accepted } } }
+  /webhooks/authorize-net:
+    post: { summary: Authorize.Net webhook, responses: { '202': { description: Accepted } } }

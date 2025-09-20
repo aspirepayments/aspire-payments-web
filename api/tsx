@@ -1,0 +1,4 @@
+
+> dev
+> tsx watch src/index.ts # - watch src/index.ts
+

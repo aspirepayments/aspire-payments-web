@@ -1,0 +1,265 @@
+// Prisma schema (minimal MVP)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Merchant {
+  id              String            @id @default(cuid())
+  name            String
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  // TODO: add gateway configs, settlement prefs
+  payments        Payment[]
+  gateways        MerchantGateway[]
+  Customer        Customer[]
+  Invoice         Invoice[]
+  Item            Item[]
+  MerchantProfile MerchantProfile?
+  FeeConfig       FeeConfig?
+  User            User[]
+  FeePlan         FeePlan[]
+  TaxRate         TaxRate[]
+}
+
+model Payment {
+  id             String           @id @default(cuid())
+  merchantId     String
+  merchant       Merchant         @relation(fields: [merchantId], references: [id])
+  amount         Int
+  currency       String           @default("USD")
+  method         String // "card" | "bank"
+  rail           String? // "ach" | "rtp_rfp" | "fednow"
+  provider       String // "nmi" | "authorize_net" | "plaid"
+  status         String // "created" | "authorized" | "captured" | "settled" | "returned" | "refunded" | "voided" | "failed" | "pending"
+  instrumentMask String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  attempts       PaymentAttempt[]
+  refunds        Refund[]
+}
+
+model PaymentAttempt {
+  id             String   @id @default(cuid())
+  paymentId      String
+  payment        Payment  @relation(fields: [paymentId], references: [id])
+  idempotencyKey String?
+  providerRef    String?
+  requestJson    Json?
+  responseJson   Json?
+  status         String
+  createdAt      DateTime @default(now())
+}
+
+model Refund {
+  id          String   @id @default(cuid())
+  paymentId   String
+  payment     Payment  @relation(fields: [paymentId], references: [id])
+  amount      Int
+  status      String
+  providerRef String?
+  createdAt   DateTime @default(now())
+}
+
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String
+  eventType   String
+  externalId  String
+  payloadHash String
+  processed   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, externalId])
+}
+
+model Idempotency {
+  key          String   @id
+  createdAt    DateTime @default(now())
+  responseJson Json?
+}
+
+model MerchantGateway {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+  type       String // 'nmi' (future: 'authorize_net', etc.)
+  apiKey     String // NMI security_key
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // compound unique so we can do where: { merchantId_type: { ... } }
+  @@unique([merchantId, type])
+}
+
+/// === Customers & Invoices (add to the end) ===
+
+model Customer {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+  firstName  String
+  lastName   String
+  company    String?
+  email      String?
+  phone      String?
+  address1   String?
+  address2   String?
+  city       String?
+  state      String?
+  postal     String?
+  country    String?  @default("US")
+  terms      String? // e.g., "Net 30"
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  invoices Invoice[]
+}
+
+model Invoice {
+  id           String   @id @default(cuid())
+  merchantId   String
+  merchant     Merchant @relation(fields: [merchantId], references: [id])
+  customerId   String
+  customer     Customer @relation(fields: [customerId], references: [id])
+  number       String   @unique
+  status       String // "draft" | "open" | "paid" | "void" | "overdue" | "partial"
+  issueDate    DateTime
+  dueDate      DateTime
+  currency     String   @default("USD")
+  subtotal     Int // cents
+  taxRateId    String?
+  taxTotal     Int      @default(0)
+  total        Int // cents
+  amountPaid   Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  term         String?
+  message      String?
+  internalNote String?
+
+  items InvoiceItem[]
+  // Optional future relation to Payment records if you decide to link them.
+  // payments     Payment[] @relation("InvoicePayments")
+}
+
+model InvoiceItem {
+  id          String  @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice @relation(fields: [invoiceId], references: [id])
+  itemId      String? // optional link to catalog item
+  item        Item?   @relation(fields: [itemId], references: [id])
+  description String
+  quantity    Int
+  unitPrice   Int // cents
+  amount      Int // quantity*unitPrice; stored for reporting
+  taxable     Boolean @default(false)
+}
+
+model Item {
+  id          String   @id @default(cuid())
+  merchantId  String
+  merchant    Merchant @relation(fields: [merchantId], references: [id])
+  name        String
+  description String?
+  unitPrice   Int // default unit price in cents
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  invoiceItems InvoiceItem[]
+}
+
+/// === Settings: Merchant Profile ===
+model MerchantProfile {
+  id         String   @id @default(cuid())
+  merchantId String   @unique
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+
+  companyName String?
+  address1    String?
+  address2    String?
+  city        String?
+  state       String?
+  postal      String?
+  country     String? @default("US")
+
+  phone      String?
+  websiteUrl String?
+  email      String?
+  taxId      String?
+  logoUrl    String? // URL for now; later: file upload
+
+  termsText         String? // “custom import”
+  refundPolicyText  String?
+  privacyPolicyText String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// === Settings: Fees ===
+model FeeConfig {
+  id         String   @id @default(cuid())
+  merchantId String   @unique
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+
+  mode                String @default("none") // "none" | "convenience" | "service"
+  // When mode = "convenience", use a flat fee in cents
+  convenienceFeeCents Int    @default(0)
+  // When mode = "service", apply a percentage to the subtotal (basis points)
+  serviceFeeBps       Int    @default(0) // e.g., 250 = 2.50%
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// === Users (very simple; no auth yet) ===
+model User {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+
+  firstName String
+  lastName  String
+  email     String   @unique
+  mobile    String?
+  role      String   @default("admin") // only "admin" for now
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// === Settings: multiple Fee Plans ===
+model FeePlan {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+
+  name                String
+  mode                String @default("none") // "none" | "convenience" | "service"
+  // When mode = "convenience", use a flat fee in cents
+  convenienceFeeCents Int    @default(0)
+  // When mode = "service", apply a percentage to the subtotal (basis points)
+  serviceFeeBps       Int    @default(0) // e.g., 250 = 2.50%
+
+  isDefault Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// === Settings: Sales Tax Rates ===
+model TaxRate {
+  id         String   @id @default(cuid())
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id])
+  name       String
+  rateBps    Int // basis points, e.g., 650 = 6.50%
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
