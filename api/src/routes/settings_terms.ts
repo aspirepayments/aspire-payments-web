@@ -1,84 +1,116 @@
-import type{ FastifyInstance } from 'fastify';
+// api/src/routes/settings_terms.ts
+import type { FastifyInstance } from 'fastify';
 import { prisma } from '../db.js';
 
 /**
- * Payment Terms settings API
- *   GET    /v1/settings/terms                 -> list all (default first)
- *   POST   /v1/settings/terms                 -> create { name, days, isDefault? }
- *   DELETE /v1/settings/terms/:id             -> delete (forbid if default)
- *   POST   /v1/settings/terms/:id/default     -> set default (single default per merchant)
- *   GET    /v1/settings/terms/default         -> get default
+ * Ensure we always have a merchant in dev and return it.
+ * Prevents FK (P2003) errors by guaranteeing merchantId exists.
  */
+async function getOrCreateMerchant() {
+  let merchant = await prisma.merchant.findFirst();
+  if (!merchant) {
+    merchant = await prisma.merchant.create({ data: { name: 'Aspire Payments (DEV)' } });
+  }
+  return merchant;
+}
+
 export async function settingsTermsRoutes(app: FastifyInstance) {
-  const merchantId = 'demo_merchant'; // TODO: replace with auth/tenant context
-
-  // List terms (default first, then by days)
-  app.get('/settings/terms', async (_req, reply) => {
+  // ---------- Payment Terms (list) ----------
+  app.get('/settings/terms', async () => {
+    const merchant = await getOrCreateMerchant();
     const terms = await prisma.paymentTerm.findMany({
-      where: { merchantId },
-      orderBy: [{ isDefault: 'desc' }, { days: 'asc' }]
+      where: { merchantId: merchant.id },
+      orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
+      select: { id: true, name: true, days: true, isDefault: true, createdAt: true, updatedAt: true },
     });
-    return reply.send({ terms });
+    return { terms };
   });
 
-  // Create term
+  // ---------- Payment Terms (default) ----------
+  // Used by the create/edit invoice pages to preselect terms
+  app.get('/settings/terms/default', async () => {
+    const merchant = await getOrCreateMerchant();
+
+    // Prefer the explicit default; if none yet, fall back to the most recently updated term (or null)
+    let term =
+      await prisma.paymentTerm.findFirst({
+        where: { merchantId: merchant.id, isDefault: true },
+        orderBy: { updatedAt: 'desc' },
+        select: { id: true, name: true, days: true, isDefault: true },
+      }) ??
+      await prisma.paymentTerm.findFirst({
+        where: { merchantId: merchant.id },
+        orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }],
+        select: { id: true, name: true, days: true, isDefault: true },
+      });
+
+    return { term }; // { term: {..} | null }
+  });
+
+  // ---------- Create Term ----------
   app.post('/settings/terms', async (req, reply) => {
-    const { name, days, isDefault } = (req.body as any) || {};
-    if (!name || typeof days !== 'number') {
-      return reply.code(400).send({ error: 'invalid_body' });
-    }
-    const created = await prisma.$transaction(async (tx) => {
-      const term = await tx.paymentTerm.create({
-        data: { merchantId, name: String(name), days: Number(days), isDefault: !!isDefault },
+    const b = (req.body as any) ?? {};
+    const merchant = await getOrCreateMerchant();
+
+    const days = Math.max(0, Math.trunc(Number(b.days ?? 0)));
+
+    const term = await prisma.paymentTerm.create({
+      data: {
+        merchantId: merchant.id,
+        name: b.name ?? 'Net 0',
+        days,
+        isDefault: !!b.isDefault,
+      },
+      select: { id: true, name: true, days: true, isDefault: true },
+    });
+
+    if (term.isDefault) {
+      await prisma.paymentTerm.updateMany({
+        where: { merchantId: merchant.id, id: { not: term.id } },
+        data: { isDefault: false },
       });
-      if (isDefault) {
-        await tx.paymentTerm.updateMany({
-          where: { merchantId, id: { not: term.id } },
-          data: { isDefault: false }
-        });
-      }
-      return term;
+    }
+
+    return reply.code(201).send({ term });
+  });
+
+  // ---------- Update Term ----------
+  app.patch('/settings/terms/:id', async (req) => {
+    const merchant = await getOrCreateMerchant();
+    const id = (req.params as any).id as string;
+    const b = (req.body as any) ?? {};
+
+    const updated = await prisma.paymentTerm.update({
+      where: { id },
+      data: {
+        name: b.name,
+        days: b.days != null ? Math.max(0, Math.trunc(Number(b.days))) : undefined,
+        isDefault: b.isDefault,
+      },
+      select: { id: true, name: true, days: true, isDefault: true },
     });
-    return reply.code(201).send({ term: created });
-  });
 
-  // Delete term (cannot delete default)
-  app.delete('/settings/terms/:id', async (req, reply) => {
-    const id = (req.params as any).id as string;
-    const existing = await prisma.paymentTerm.findUnique({ where: { id } });
-    if (!existing || existing.merchantId !== merchantId) {
-      return reply.code(404).send({ error: 'not_found' });
-    }
-    if (existing.isDefault) {
-      return reply.code(400).send({ error: 'cannot_delete_default' });
-    }
-    await prisma.paymentTerm.delete({ where: { id } });
-    return reply.send({ ok: true });
-  });
-
-  // Set default term
-  app.post('/settings/terms/:id/default', async (req, reply) => {
-    const id = (req.params as any).id as string;
-    const existing = await prisma.paymentTerm.findUnique({ where: { id } });
-    if (!existing || existing.merchantId !== merchantId) {
-      return reply.code(404).send({ error: 'not_found' });
-    }
-    await prisma.$transaction(async (tx) => {
-      await tx.paymentTerm.update({ where: { id }, data: { isDefault: true } });
-      await tx.paymentTerm.updateMany({
-        where: { merchantId, id: { not: id } },
-        data: { isDefault: false }
+    if (updated.isDefault) {
+      await prisma.paymentTerm.updateMany({
+        where: { merchantId: merchant.id, id: { not: updated.id } },
+        data: { isDefault: false },
       });
-    });
-    return reply.send({ ok: true });
+    }
+
+    return { term: updated };
   });
 
-  // Get default
-  app.get('/settings/terms/default', async (_req, reply) => {
-    const term = await prisma.paymentTerm.findFirst({
-      where: { merchantId, isDefault: true },
-      orderBy: { days: 'asc' }
+  // ---------- Make Default ----------
+  app.post('/settings/terms/:id/default', async (req) => {
+    const merchant = await getOrCreateMerchant();
+    const id = (req.params as any).id as string;
+
+    await prisma.paymentTerm.update({ where: { id }, data: { isDefault: true } });
+    await prisma.paymentTerm.updateMany({
+      where: { merchantId: merchant.id, id: { not: id } },
+      data: { isDefault: false },
     });
-    return reply.send({ term: term ?? null });
+
+    return { ok: true };
   });
 }

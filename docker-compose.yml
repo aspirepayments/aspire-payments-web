@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16
+    container_name: aspire-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: aspire
+      POSTGRES_PASSWORD: AspireDbLocal25!
+      POSTGRES_DB: aspire_dev
+    volumes:
+      # Named volume persists data between restarts
+      - pgdata:/var/lib/postgresql/data
+      # Optional: put *.sql or *.sh files here to auto-run on first init only
+      # - ./db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aspire -d aspire_dev -h 127.0.0.1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata: {}

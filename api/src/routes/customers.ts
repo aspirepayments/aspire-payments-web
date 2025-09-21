@@ -1,3 +1,4 @@
+// api/src/routes/customers.ts
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../db.js';
 
@@ -22,6 +23,15 @@ type UpdateBody = Partial<{
   terms: string | null;
 }>;
 
+// Ensure a merchant exists and return it (prevents FK errors)
+async function getOrCreateMerchant() {
+  let merchant = await prisma.merchant.findFirst();
+  if (!merchant) {
+    merchant = await prisma.merchant.create({ data: { name: 'Aspire Payments (DEV)' } });
+  }
+  return merchant;
+}
+
 /**
  * Customers routes:
  *  GET   /v1/customers?q=&limit=&cursor=   -> list with search + cursor pagination
@@ -30,29 +40,34 @@ type UpdateBody = Partial<{
  *  POST  /v1/customers                     -> create
  */
 export async function customersRoutes(app: FastifyInstance) {
-  // LIST with search + cursor pagination (defensive + Prisma-correct)
+  // LIST with search + cursor pagination (scoped to merchant)
   app.get('/customers', async (req, reply) => {
     try {
+      const merchant = await getOrCreateMerchant();
       const { q, limit = '25', cursor } = (req.query as ListQuery) || {};
       const take = Math.min(Math.max(parseInt(String(limit), 10) || 25, 1), 100);
 
-      const where = q?.trim()
-        ? {
-            OR: [
-              { firstName: { contains: q, mode: 'insensitive' } },
-              { lastName:  { contains: q, mode: 'insensitive' } },
-              { company:   { contains: q, mode: 'insensitive' } },
-              { email:     { contains: q, mode: 'insensitive' } },
-              { phone:     { contains: q, mode: 'insensitive' } },
-            ],
-          }
-        : undefined;
+      const search = q?.trim();
+      const where = {
+        merchantId: merchant.id,
+        ...(search
+          ? {
+              OR: [
+                { firstName: { contains: search, mode: 'insensitive' } },
+                { lastName:  { contains: search, mode: 'insensitive' } },
+                { company:   { contains: search, mode: 'insensitive' } },
+                { email:     { contains: search, mode: 'insensitive' } },
+                { phone:     { contains: search, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
+      };
 
       const customers = await prisma.customer.findMany({
         where,
-        take: take + 1,                   // fetch one extra for next-cursor detection
-        ...(cursor ? { skip: 1, cursor: { id: String(cursor) } } : {}), // Prisma cursor pagination
-        orderBy: { id: 'desc' },    // assumes createdAt exists; adjust to your model if needed
+        take: take + 1,                                   // fetch one extra for next-cursor detection
+        ...(cursor ? { skip: 1, cursor: { id: String(cursor) } } : {}),
+        orderBy: { id: 'desc' },
         select: {
           id: true, firstName: true, lastName: true, email: true, company: true,
           phone: true, address1: true, address2: true, city: true, state: true,
@@ -71,7 +86,7 @@ export async function customersRoutes(app: FastifyInstance) {
       req.log.error({ err }, 'GET /customers failed');
       return reply.status(500).send({
         message: 'Failed to list customers',
-        hint: 'Ensure Prisma model `Customer` exists and fields used in orderBy/select are valid; use take/skip/cursor for pagination.',
+        hint: 'Verify Customer model/fields and pagination params.',
       });
     }
   });
@@ -104,7 +119,9 @@ export async function customersRoutes(app: FastifyInstance) {
           firstName: body.firstName ?? existing.firstName,
           lastName:  body.lastName  ?? existing.lastName,
           company:   body.company   ?? existing.company,
-          email:     body.email     ?? existing.email,
+          email:     body.email     !== undefined
+                        ? (body.email ? String(body.email).trim().toLowerCase() : null)
+                        : existing.email,
           phone:     body.phone     ?? existing.phone,
           address1:  body.address1  ?? existing.address1,
           address2:  body.address2  ?? existing.address2,
@@ -118,33 +135,59 @@ export async function customersRoutes(app: FastifyInstance) {
 
       return reply.send({ customer: updated });
     } catch (err: any) {
+      // P2002 = unique constraint (e.g., merchantId+email uniqueness)
+      if (err?.code === 'P2002') {
+        return reply.status(409).send({ error: 'duplicate', message: 'Email already exists for this merchant' });
+      }
       req.log.error({ err }, 'PATCH /customers/:id failed');
       return reply.status(500).send({ message: 'Failed to update customer' });
     }
   });
 
-  // CREATE
+  // CREATE (scoped to merchant, dedupe on email)
   app.post('/customers', async (req, reply) => {
     try {
-      const b = req.body as any;
-      const created = await prisma.customer.create({
-        data: {
-          merchantId: b.merchantId ?? 'demo_merchant',
-          firstName:  b.firstName,
-          lastName:   b.lastName,
-          company:    b.company   ?? null,
-          email:      b.email     ?? null,
-          phone:      b.phone     ?? null,
-          address1:   b.address1  ?? null,
-          address2:   b.address2  ?? null,
-          city:       b.city      ?? null,
-          state:      b.state     ?? null,
-          postal:     b.postal    ?? null,
-          country:    b.country   ?? 'US',
-          terms:      b.terms     ?? 'Net 30',
-        },
-      });
-      return reply.code(201).send({ customer: created });
+      const merchant = await getOrCreateMerchant();
+      const b = (req.body as any) ?? {};
+
+      // require at least some identifier
+      if (!b.firstName && !b.lastName && !b.company && !b.email) {
+        return reply.code(400).send({ error: 'missing_fields', message: 'Provide name, company, or email.' });
+      }
+
+      const email = b.email ? String(b.email).trim().toLowerCase() : null;
+
+      try {
+        const created = await prisma.customer.create({
+          data: {
+            merchantId: merchant.id,
+            firstName:  b.firstName ?? null,
+            lastName:   b.lastName  ?? null,
+            company:    b.company   ?? null,
+            email,                            // nullable
+            phone:      b.phone     ?? null,
+            address1:   b.address1  ?? null,
+            address2:   b.address2  ?? null,
+            city:       b.city      ?? null,
+            state:      b.state     ?? null,
+            postal:     b.postal    ?? null,
+            country:    b.country   ?? 'US',
+            terms:      b.terms     ?? 'Net 30',
+          },
+        });
+        return reply.code(201).send({ customer: created });
+      } catch (e: any) {
+        // P2002 unique constraint (e.g., unique (merchantId, email))
+        if (e?.code === 'P2002' && email) {
+          const existing = await prisma.customer.findFirst({
+            where: { merchantId: merchant.id, email },
+          });
+          if (existing) {
+            return reply.code(200).send({ customer: existing, deduped: true });
+          }
+        }
+        throw e;
+      }
     } catch (err: any) {
       req.log.error({ err }, 'POST /customers failed');
       return reply.status(500).send({ message: 'Failed to create customer' });

@@ -6,7 +6,6 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  
 }
 
 model Merchant {
@@ -105,7 +104,6 @@ model MerchantGateway {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  // compound unique so we can do where: { merchantId_type: { ... } }
   @@unique([merchantId, type])
 }
 
@@ -138,17 +136,27 @@ model Invoice {
   id           String   @id @default(cuid())
   merchantId   String
   merchant     Merchant @relation(fields: [merchantId], references: [id])
+
   customerId   String
   customer     Customer @relation(fields: [customerId], references: [id])
+
   number       String   @unique
   status       String // "draft" | "open" | "paid" | "void" | "overdue" | "partial"
   issueDate    DateTime
   dueDate      DateTime
   currency     String   @default("USD")
-  subtotal     Int // cents
+
+  // totals (cents)
+  subtotal     Int
   taxRateId    String?
   taxTotal     Int      @default(0)
-  total        Int // cents
+
+  // NEW: store computed fee and selected plan on the invoice
+  feeCents     Int      @default(0)
+  feePlanId    String?
+  feePlan      FeePlan? @relation(fields: [feePlanId], references: [id])
+
+  total        Int
   amountPaid   Int      @default(0)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -229,18 +237,18 @@ model FeeConfig {
 
 /// === Users (very simple; no auth yet) ===
 model User {
-  id         String   @id @default(cuid())
-  merchantId String
-  merchant   Merchant @relation(fields: [merchantId], references: [id])
+  id           String   @id @default(cuid())
+  merchantId   String
+  merchant     Merchant @relation(fields: [merchantId], references: [id])
 
-  firstName String
-  lastName  String
-  email     String   @unique
-  mobile    String?
-  role      String   @default("admin") // only "admin" for now
+  firstName    String
+  lastName     String
+  email        String   @unique
+  mobile       String?
+  role         String   @default("admin") // only "admin" for now
   passwordHash String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 /// === Settings: multiple Fee Plans ===
@@ -253,8 +261,10 @@ model FeePlan {
   mode                String @default("none") // "none" | "convenience" | "service"
   convenienceFeeCents Int    @default(0)
   serviceFeeBps       Int    @default(0) // e.g., 250 = 2.50%
+  isDefault           Boolean @default(false)
 
-  isDefault Boolean @default(false)
+  // NEW: optional back-reference (handy for deletes/reporting)
+  invoices  Invoice[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -273,8 +283,6 @@ model TaxRate {
 }
 
 /// === Saved Payment Methods (Vault) ===
-/// Use ONE table for both cards and Straddle pay-by-bank.
-/// For Straddle pay-by-bank: type='bank', vaultProvider='straddle', providerRef=<paykey>
 model PaymentMethod {
   id         String   @id @default(cuid())
   merchantId String
@@ -301,7 +309,6 @@ model PaymentMethod {
 }
 
 /// === Straddle connection (per merchant or org-level) ===
-/// Keep exactly one row per merchant per environment.
 model StraddleConnection {
   id         String   @id @default(cuid())
   merchantId String

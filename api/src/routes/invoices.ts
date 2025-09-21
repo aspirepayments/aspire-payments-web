@@ -19,11 +19,11 @@ const UpdateInvoice = z.object({
   customerId: z.string().optional(),
   issueDate: z.string().optional(),     // ISO "YYYY-MM-DD"
   term: z.string().optional(),
-  dueDate: z.string().optional(),       // ISO; server re-computes if absent but issue/term changed
+  dueDate: z.string().optional(),       // ISO
   currency: z.string().optional(),
-  feePlanId: z.string().optional(),
+  feePlanId: z.string().optional(),     // connect/disconnect relation
   taxRateId: z.string().optional(),
-  items: z.array(InvoiceItemInput).min(1).optional(),  // if present, we replace all items
+  items: z.array(InvoiceItemInput).min(1).optional(), // if present, replace all items
   message: z.string().optional(),
   internalNote: z.string().optional(),
   status: z.enum(['draft','open','paid','overdue','partial','void']).optional(),
@@ -47,19 +47,40 @@ function calcDue(issueISO?: string, term?: string, explicitDueISO?: string) {
   return new Date(issue.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
+// Heuristic: is this row likely a "fee" row (legacy fee-as-item)?
+function looksLikeFeeRow(r: { itemId: string|null; description: string; taxable: boolean }) {
+  const d = (r.description || '').toLowerCase();
+  return r.itemId === null && (d.includes('fee') || d.includes('convenience') || d.includes('service'));
+}
+
 export async function invoicesRoutes(app: FastifyInstance) {
-  // List invoices
+  // -------------------- LIST --------------------
   app.get('/invoices', async (req) => {
     const merchantId = (req.query as any)?.merchantId ?? 'demo_merchant';
+
     const invoices = await prisma.invoice.findMany({
       where: { merchantId },
       orderBy: { issueDate: 'desc' },
       take: 200,
+      select: {
+        id: true,
+        number: true,
+        issueDate: true,
+        dueDate: true,
+        status: true,
+        subtotal: true,
+        taxTotal: true,
+        feeCents: true,
+        total: true,
+        amountPaid: true,
+        currency: true,
+        customerId: true,
+      }
     });
     return { invoices };
   });
 
-  // GET one (include items + customer)
+  // -------------------- GET ONE --------------------
   app.get('/invoices/:id', async (req, reply) => {
     const id = (req.params as any).id as string;
     const invoice = await prisma.invoice.findUnique({
@@ -67,13 +88,107 @@ export async function invoicesRoutes(app: FastifyInstance) {
       include: {
         items: true,
         customer: { select: { id: true, firstName: true, lastName: true, company: true, email: true } },
+        feePlan:  { select: { id: true, name: true, mode: true, convenienceFeeCents: true, serviceFeeBps: true } },
       },
     });
     if (!invoice) return reply.code(404).send({ error: 'not_found' });
     return { invoice };
   });
 
-  // PATCH an invoice (simple fields e.g., mark paid)
+  // -------------------- CREATE --------------------
+  app.post('/invoices', async (req, reply) => {
+    const b = (req.body as any) ?? {};
+
+    const merchant =
+      (await prisma.merchant.findFirst()) ??
+      (await prisma.merchant.create({ data: { name: 'Aspire Payments (DEV)' } }));
+
+    if (!b.customerId) return reply.code(400).send({ error: 'missing_customer' });
+
+    const issueDate = b.issueDate ? new Date(b.issueDate) : new Date();
+    const dueDate   = b.dueDate   ? new Date(b.dueDate)   : issueDate;
+    const currency  = b.currency  || 'USD';
+    const term      = b.term      || null;
+
+    // items (never put fee as a line item): strip any fee-looking rows first
+    let items = (b.items ?? []).map((it: any) => {
+      const qty  = Math.max(1, Number(it.quantity || 1));
+      const unit = Math.max(0, Number(it.unitPrice || 0));
+      return {
+        itemId: it.itemId ?? null,
+        description: it.description ?? 'Item',
+        quantity: qty,
+        unitPrice: unit,
+        amount: qty * unit,
+        taxable: !!it.taxable,
+      };
+    });
+    items = items.filter(r => !looksLikeFeeRow({ itemId: r.itemId, description: r.description, taxable: r.taxable }));
+
+    const subtotal = items.reduce((s: number, r: any) => s + r.amount, 0);
+
+    // fee (convenience/service)
+    let feeCents = 0;
+    if (b.feePlanId) {
+      const plan = await prisma.feePlan.findUnique({ where: { id: b.feePlanId } });
+      if (plan) {
+        if (plan.mode === 'convenience' && (plan.convenienceFeeCents ?? 0) > 0) {
+          feeCents = plan.convenienceFeeCents ?? 0;
+        } else if (plan.mode === 'service' && (plan.serviceFeeBps ?? 0) > 0) {
+          feeCents = Math.round(subtotal * ((plan.serviceFeeBps ?? 0) / 10000));
+        }
+      }
+    }
+
+    // tax (only taxable items)
+    let taxTotal = 0;
+    if (b.taxRateId) {
+      const rate = await prisma.taxRate.findUnique({ where: { id: b.taxRateId } });
+      if (rate) {
+        const taxableBase = items.filter((r: any) => r.taxable).reduce((a: number, r: any) => a + r.amount, 0);
+        taxTotal = Math.round(taxableBase * (rate.rateBps / 10000));
+      }
+    }
+
+    const total = subtotal + feeCents + taxTotal;
+
+    const created = await prisma.$transaction(async (tx) => {
+      const inv = await tx.invoice.create({
+        data: {
+          merchant:  { connect: { id: merchant.id } },   // relation connect
+          customer:  { connect: { id: b.customerId } },  // relation connect
+          number:    b.number ?? `INV-${Date.now()}`,
+          status:    'open',                             // or 'draft' if you want a finalize step
+          issueDate, dueDate, currency, term,
+          subtotal, feeCents, taxTotal, total,
+          ...(b.taxRateId ? { taxRateId: b.taxRateId } : {}),
+          ...(b.feePlanId ? { feePlan: { connect: { id: b.feePlanId } } } : {}),
+        }
+      });
+
+      if (items.length) {
+        await tx.invoiceItem.createMany({
+          data: items.map((r: any) => ({
+            invoiceId: inv.id,
+            itemId: r.itemId,
+            description: r.description,
+            quantity: r.quantity,
+            unitPrice: r.unitPrice,
+            amount: r.amount,
+            taxable: r.taxable,
+          }))
+        });
+      }
+      return inv;
+    });
+
+    reply
+      .code(201)
+      .header('Location', `/v1/invoices/${created.id}`)
+      .send({ id: created.id });
+  });
+
+  // -------------------- PATCH SMALL FIELDS --------------------
   app.patch('/invoices/:id', async (req, reply) => {
     const id = (req.params as any).id as string;
     const body = (req.body as any) ?? {};
@@ -84,7 +199,7 @@ export async function invoicesRoutes(app: FastifyInstance) {
     return { invoice: inv };
   });
 
-  // PUT an invoice (full edit: header + lines; recompute fees/tax/totals)
+  // -------------------- UPDATE (PUT) --------------------
   app.put('/invoices/:id', async (req, reply) => {
     const parsed = UpdateInvoice.safeParse(req.body);
     if (!parsed.success) {
@@ -95,21 +210,22 @@ export async function invoicesRoutes(app: FastifyInstance) {
     const id = (req.params as any).id as string;
 
     try {
-      // Fetch existing invoice (keep amountPaid, number)
-      const existing = await prisma.invoice.findUnique({ where: { id }, include: { items: true } });
+      const existing = await prisma.invoice.findUnique({
+        where: { id },
+        include: { items: true, feePlan: true }
+      });
       if (!existing) return reply.code(404).send({ error: 'not_found' });
 
-      // Compute due date if issue/term changed and dueDate not explicitly set
-      let nextDue: Date | undefined = undefined;
+      // due date
+      let nextDue: Date | undefined;
       if (body.issueDate || body.term || body.dueDate) {
         const issueISO = body.issueDate ?? existing.issueDate.toISOString().slice(0,10);
         nextDue = calcDue(issueISO, body.term ?? existing.term ?? undefined, body.dueDate);
       }
 
-      // Lines: if body.items provided, replace; else keep existing
+      // items: strip any legacy "fee-as-item" rows
       let lineRows: Array<{itemId: string|null; description: string; quantity: number; unitPrice: number; amount: number; taxable: boolean}> = [];
       if (body.items) {
-        // Build from payload
         for (const it of body.items) {
           const qty = it.quantity;
           const unit = it.unitPrice;
@@ -129,39 +245,31 @@ export async function invoicesRoutes(app: FastifyInstance) {
           });
         }
       } else {
-        // Keep existing rows as-is
         lineRows = existing.items.map(it => ({
           itemId: it.itemId, description: it.description, quantity: it.quantity,
           unitPrice: it.unitPrice, amount: it.amount, taxable: (it as any).taxable ?? false
         }));
       }
+      // strip fee-like rows before computing subtotal
+      lineRows = lineRows.filter(r => !looksLikeFeeRow({ itemId: r.itemId, description: r.description, taxable: r.taxable }));
 
-      // Subtotal
-      let subtotal = lineRows.reduce((acc, r) => acc + r.amount, 0);
+      const subtotal = lineRows.reduce((acc, r) => acc + r.amount, 0);
 
-      // Fee Plan
-      let feePlanId = body.feePlanId ?? existing.taxRateId /* placeholder variable reuse fix next line */;
-      // ^ the above is accidental potential confusion; set feePlanId correctly:
-      feePlanId = body.feePlanId ?? (null as any);
-
-      if (body.feePlanId) {
-        const plan = await prisma.feePlan.findUnique({ where: { id: body.feePlanId } });
+      // fee (not as an item)
+      const incomingFeePlanId = body.feePlanId ?? null;
+      let feeCents = 0;
+      if (incomingFeePlanId) {
+        const plan = await prisma.feePlan.findUnique({ where: { id: incomingFeePlanId } });
         if (plan) {
-          if (plan.mode === 'convenience' && plan.convenienceFeeCents > 0) {
-            const amount = plan.convenienceFeeCents;
-            lineRows.push({ itemId: null, description: plan.name || 'Convenience Fee', quantity: 1, unitPrice: amount, amount, taxable: false });
-            subtotal += amount;
-          } else if (plan.mode === 'service' && plan.serviceFeeBps > 0) {
-            const amount = Math.round(subtotal * (plan.serviceFeeBps / 10000));
-            if (amount > 0) {
-              lineRows.push({ itemId: null, description: `${plan.name || 'Service Fee'} (${(plan.serviceFeeBps/100).toFixed(2)}%)`, quantity: 1, unitPrice: amount, amount, taxable: false });
-              subtotal += amount;
-            }
+          if (plan.mode === 'convenience' && (plan.convenienceFeeCents ?? 0) > 0) {
+            feeCents = plan.convenienceFeeCents ?? 0;
+          } else if (plan.mode === 'service' && (plan.serviceFeeBps ?? 0) > 0) {
+            feeCents = Math.round(subtotal * ((plan.serviceFeeBps ?? 0) / 10000));
           }
         }
       }
 
-      // Tax
+      // tax (taxable items only)
       let taxTotal = 0;
       const taxRateId = body.taxRateId ?? existing.taxRateId ?? undefined;
       if (taxRateId) {
@@ -172,25 +280,42 @@ export async function invoicesRoutes(app: FastifyInstance) {
         }
       }
 
-      const total = subtotal + taxTotal;
+      const total = subtotal + feeCents + taxTotal;
 
-      // Prepare invoice update
-      const updateData: any = {
-        customerId: body.customerId ?? existing.customerId,
+      // scalars
+      const updateDataBase: any = {
         issueDate: body.issueDate ? new Date(body.issueDate) : existing.issueDate,
         dueDate: nextDue ? nextDue : existing.dueDate,
         term: body.term ?? existing.term,
         currency: body.currency ?? existing.currency,
         taxRateId: taxRateId ?? null,
         subtotal,
+        feeCents,
         taxTotal,
         total,
         message: body.message ?? existing.message,
         internalNote: body.internalNote ?? existing.internalNote,
-        status: body.status ?? existing.status,
       };
 
-      // Transaction: replace items if provided
+      // relations (nested writes — Prisma pattern)
+      const relationUpdates: any = {};
+      relationUpdates.merchant = { connect: { id: body.merchantId ?? existing.merchantId ?? 'demo_merchant' } };
+      if (body.customerId) relationUpdates.customer = { connect: { id: body.customerId } };
+      if (incomingFeePlanId) {
+        relationUpdates.feePlan = { connect: { id: incomingFeePlanId } };
+      } else if (existing.feePlan) {
+        relationUpdates.feePlan = { disconnect: true };
+      }
+
+      // auto-open rule
+      const hasCustomer = !!(body.customerId || existing.customerId);
+      const hasIssue = !!(body.issueDate || existing.issueDate);
+      const hasLines = lineRows.length > 0;
+      const nextStatus =
+        body.status ?? (existing.status === 'draft' && hasCustomer && hasIssue && hasLines ? 'open' : existing.status);
+
+      const updateData = { ...updateDataBase, ...relationUpdates, status: nextStatus };
+
       const updated = await prisma.$transaction(async (tx) => {
         if (body.items) {
           await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
@@ -216,7 +341,8 @@ export async function invoicesRoutes(app: FastifyInstance) {
     }
   });
 
-  // Revenue summary
+  // -------------------- REPORTS --------------------
+  // Cashflow (paid/partial)
   app.get('/reports/revenue', async (req) => {
     const merchantId = (req.query as any)?.merchantId ?? 'demo_merchant';
     const days = Math.min(Number((req.query as any)?.days ?? 30), 365);
@@ -234,7 +360,18 @@ export async function invoicesRoutes(app: FastifyInstance) {
     return { series };
   });
 
-  // Transactions count
+  // Open A/R (open|overdue|partial)
+  app.get('/reports/ar-open', async (req) => {
+    const merchantId = (req.query as any)?.merchantId ?? 'demo_merchant';
+    const rows = await prisma.invoice.findMany({
+      where: { merchantId, status: { in: ['open','overdue','partial'] } },
+      select: { total: true, amountPaid: true },
+    });
+    const sumCents = rows.reduce((s, r) => s + Math.max((r.total || 0) - (r.amountPaid || 0), 0), 0);
+    const count    = rows.length;
+    return { sumCents, count };
+  });
+
   app.get('/reports/txnCount', async (req) => {
     const merchantId = (req.query as any)?.merchantId ?? 'demo_merchant';
     const days = Math.min(Number((req.query as any)?.days ?? 30), 365);
@@ -252,7 +389,6 @@ export async function invoicesRoutes(app: FastifyInstance) {
     return { series };
   });
 
-  // A/R aging
   app.get('/reports/aging', async (req) => {
     const merchantId = (req.query as any)?.merchantId ?? 'demo_merchant';
     const today = new Date();
@@ -272,5 +408,65 @@ export async function invoicesRoutes(app: FastifyInstance) {
       else if (overdueDays > 90) buckets['90+'] += remaining;
     }
     return { buckets };
+  });
+
+  // -------------------- ADMIN REPAIR (DEV ONLY) --------------------
+  // Removes legacy "fee-as-item" rows, recomputes feeCents/tax/total.
+  app.post('/admin/repair/fees', async (_req, reply) => {
+    const batch = 200;
+    let cursor: string | null = null;
+    let repaired = 0;
+
+    while (true) {
+      const invoices = await prisma.invoice.findMany({
+        take: batch,
+        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+        include: { items: true, feePlan: true },
+        orderBy: { id: 'asc' }
+      });
+      if (!invoices.length) break;
+      cursor = invoices[invoices.length - 1].id;
+
+      for (const inv of invoices) {
+        const feeItems = inv.items.filter(it =>
+          looksLikeFeeRow({ itemId: it.itemId, description: it.description, taxable: (it as any).taxable ?? false })
+        );
+        if (!feeItems.length) continue;
+
+        const kept = inv.items.filter(it => !feeItems.includes(it));
+        const subtotal = kept.reduce((s, r) => s + r.amount, 0);
+
+        let feeCents = 0;
+        if (inv.feePlan) {
+          const mode = inv.feePlan.mode;
+          const flat = inv.feePlan.convenienceFeeCents ?? 0;
+          const bps  = inv.feePlan.serviceFeeBps ?? 0;
+          if (mode === 'convenience' && flat > 0) feeCents = flat;
+          else if (mode === 'service' && bps > 0) feeCents = Math.round(subtotal * (bps / 10000));
+        }
+
+        let taxTotal = 0;
+        if (inv as any && (inv as any).taxRateId) {
+          const rate = await prisma.taxRate.findUnique({ where: { id: (inv as any).taxRateId } });
+          if (rate) {
+            const taxableBase = kept
+              .filter(it => (it as any).taxable ?? false)
+              .reduce((a, r) => a + r.amount, 0);
+            taxTotal = Math.round(taxableBase * (rate.rateBps / 10000));
+          }
+        }
+
+        const total = subtotal + feeCents + taxTotal;
+
+        await prisma.$transaction(async tx => {
+          await tx.invoiceItem.deleteMany({ where: { id: { in: feeItems.map(f => f.id) } } });
+          await tx.invoice.update({ where: { id: inv.id }, data: { subtotal, feeCents, taxTotal, total } });
+        });
+
+        repaired++;
+      }
+    }
+
+    return reply.send({ ok: true, repaired });
   });
 }
